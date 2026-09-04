@@ -31,8 +31,21 @@ pickle  main → release/1.2
 
 One file, no dependencies beyond bash 4+ and git.
 
+On **GitHub Actions** there is nothing to install — the action carries the
+script, so the version is pinned by the tag you reference:
+
+```yaml
+- uses: riceball-tw/pickle@v1
+  with:
+    target: release/1.2
+```
+
+**Anywhere else**, pin to a release tag. Do not point CI at `main`: it moves,
+and this tool writes to release branches.
+
 ```bash
-curl -fsSL https://example.com/pickle -o /usr/local/bin/pickle
+curl -fsSL https://raw.githubusercontent.com/riceball-tw/pickle/v1.0.0/pickle \
+  -o /usr/local/bin/pickle
 chmod +x /usr/local/bin/pickle
 ```
 
@@ -189,7 +202,35 @@ PR, because that would mean a platform API, which is the thing it is not.
 
 ## CI
 
-See [`examples/`](examples/). Two things matter:
+See [`examples/`](examples/).
+
+### GitHub Actions
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0          # required: cherry-pick needs history
+
+- uses: riceball-tw/pickle@v1
+  with:
+    target: release/1.2
+    from: main
+```
+
+| input | default | |
+|---|---|---|
+| `command` | `sync` | `sync`, `status`, `cut` or `skip` |
+| `target` | — | Release branch. Required. |
+| `from` | repo default branch | Trunk branch. |
+| `types` | `fix` | Conventional Commit types, comma separated. |
+| `include` / `exclude` | — | Subject regexes, as per the flags above. |
+| `args` | — | Any other flags, verbatim: `--keep-going --allow-breaking` |
+
+The job needs `permissions: contents: write` to push.
+
+### Everything else
+
+Two things matter:
 
 - **Give the checkout full history.** `actions/checkout` defaults to
   `fetch-depth: 1`, which makes cherry-pick impossible. pickle detects a shallow

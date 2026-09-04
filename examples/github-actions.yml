@@ -32,18 +32,24 @@ jobs:
           # faster and clearer.
           fetch-depth: 0
 
-      - name: install pickle
-        run: |
-          curl -fsSL https://example.com/pickle -o /usr/local/bin/pickle
-          chmod +x /usr/local/bin/pickle
-
       # Exits 1 when something conflicts, which fails the job on purpose:
       # a red build is how the team finds out a fix needs backporting by hand.
-      - name: sync
-        run: pickle sync --target "$RELEASE_BRANCH" --from main
+      - uses: riceball-tw/pickle@v1
+        with:
+          target: ${{ env.RELEASE_BRANCH }}
+          from: main
 
-  # If release/* is a protected branch, the push above is rejected. Either grant
-  # this workflow's identity an exception, or drop --no-push here and have a
-  # human land the branch:
+      # Other things you might want:
+      #
+      #   types: fix,perf              pick perf commits too
+      #   include: '^\[HOTFIX\]'       a non-conventional-commit convention
+      #   args: --keep-going           land what applies, report the rest
+      #   command: status              preview only, never write
+
+  # If release/* is a protected branch the push is rejected. Either grant this
+  # workflow's identity an exception, or preview only and let a human land it:
   #
-  #   - run: pickle sync --target "$RELEASE_BRANCH" --from main --no-push
+  #   - uses: riceball-tw/pickle@v1
+  #     with:
+  #       command: status
+  #       target: ${{ env.RELEASE_BRANCH }}

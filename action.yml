@@ -1,0 +1,64 @@
+name: pickle
+description: Backport hotfixes from trunk onto a release branch, using only git
+author: riceball-tw
+
+branding:
+  icon: git-branch
+  color: green
+
+inputs:
+  command:
+    description: 'Subcommand: sync, status, cut or skip'
+    required: false
+    default: sync
+  target:
+    description: Release branch to pick onto, e.g. release/1.2
+    required: true
+  from:
+    description: Trunk branch to pick from. Defaults to the repository's default branch.
+    required: false
+    default: ''
+  types:
+    description: Conventional Commit types to pick, comma separated. Defaults to fix.
+    required: false
+    default: ''
+  include:
+    description: Match commit subjects with this regex instead of using types.
+    required: false
+    default: ''
+  exclude:
+    description: Reject commit subjects matching this regex.
+    required: false
+    default: ''
+  args:
+    description: Extra flags passed through verbatim, e.g. "--keep-going --allow-breaking"
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Inputs are passed as environment variables and never interpolated into
+      # the script body: a ${{ }} expansion inside a run block is substituted as
+      # text before bash sees it, which turns any attacker-controlled input into
+      # arbitrary shell.
+      env:
+        PICKLE_TARGET: ${{ inputs.target }}
+        PICKLE_FROM: ${{ inputs.from }}
+        PICKLE_TYPES: ${{ inputs.types }}
+        PICKLE_INCLUDE: ${{ inputs.include }}
+        PICKLE_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_ARGS: ${{ inputs.args }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        # pickle reads PICKLE_* itself, and treats an empty value as unset, so
+        # the optional inputs above need no further handling.
+        extra=()
+        [[ -n $INPUT_ARGS ]] && read -ra extra <<< "$INPUT_ARGS"
+
+        chmod +x "$ACTION_PATH/pickle"
+        "$ACTION_PATH/pickle" "$INPUT_COMMAND" ${extra[@]+"${extra[@]}"}

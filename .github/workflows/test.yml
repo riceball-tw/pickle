@@ -1,0 +1,60 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: versions
+        run: |
+          bash --version | head -1
+          git --version
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          }
+          shellcheck pickle
+          shellcheck -e SC1090,SC1091 test/run.sh test/cases/*.sh
+
+      - name: tests
+        run: ./test/run.sh
+
+  # Proves the action wrapper itself works, not just the script: builds a
+  # throwaway repo in the workspace root, then runs the action against it
+  # exactly as a user would.
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: .pickle-src
+
+      - name: build a fixture repo in the workspace root
+        run: |
+          set -euo pipefail
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          git init -q -b main .
+          echo '.pickle-src/' > .gitignore
+          echo base > app.txt
+          git add app.txt .gitignore && git commit -qm "chore: initial"
+          git branch release/1.2
+          echo one   > a.txt && git add a.txt && git commit -qm "fix(DS-1): one"
+          echo two   > b.txt && git add b.txt && git commit -qm "feat(DS-2): two"
+          echo three > c.txt && git add c.txt && git commit -qm "fix(DS-3): three"
+
+      - name: run the action
+        uses: ./.pickle-src
+        with:
+          command: status
+          target: release/1.2
+          from: main
