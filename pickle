@@ -593,8 +593,9 @@ print_report() {
 
     printf '\n'
     if (( DRY_RUN )); then
-        printf '  %s would pick, %s skipped%s\n' "$picked" "$skipped" \
-            "$( (( conflicted )) && printf ', %s conflicting' "$conflicted" || true )"
+        local also=""
+        (( conflicted )) && also=", $conflicted conflicting"
+        printf '  %s would pick, %s skipped%s\n' "$picked" "$skipped" "$also"
     else
         printf '  %s%s picked%s, %s skipped' "$C_BOLD" "$picked" "$C_RESET" "$skipped"
         (( conflicted )) && printf ', %s%s conflicted%s' "$C_RED" "$conflicted" "$C_RESET"
@@ -700,9 +701,10 @@ require_target() {
 }
 
 header() {
+    local mode=""
+    (( DRY_RUN )) && mode="  [dry run]"
     printf '\n%spickle%s  %s → %s%s\n\n' \
-        "$C_BOLD" "$C_RESET" "$FROM" "$TARGET" \
-        "$( (( DRY_RUN )) && printf '  [dry run]' || true )"
+        "$C_BOLD" "$C_RESET" "$FROM" "$TARGET" "$mode"
 }
 
 maybe_push() {
