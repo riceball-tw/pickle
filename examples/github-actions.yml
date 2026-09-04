@@ -1,0 +1,49 @@
+# Backport hotfixes from trunk onto a release branch.
+#
+# Put this at .github/workflows/backport.yml and set RELEASE_BRANCH below.
+
+name: backport to release
+
+on:
+  schedule:
+    - cron: '0 2 * * *'          # nightly
+  push:
+    branches: [main]             # or immediately on every merge to trunk
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: release branch to sync
+        required: false
+
+permissions:
+  contents: write                # pickle pushes straight to the release branch
+
+env:
+  RELEASE_BRANCH: ${{ github.event.inputs.release_branch || 'release/1.2' }}
+
+jobs:
+  backport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Required. The default (depth 1) makes cherry-pick impossible.
+          # pickle will deepen a shallow clone itself, but doing it here is
+          # faster and clearer.
+          fetch-depth: 0
+
+      - name: install pickle
+        run: |
+          curl -fsSL https://example.com/pickle -o /usr/local/bin/pickle
+          chmod +x /usr/local/bin/pickle
+
+      # Exits 1 when something conflicts, which fails the job on purpose:
+      # a red build is how the team finds out a fix needs backporting by hand.
+      - name: sync
+        run: pickle sync --target "$RELEASE_BRANCH" --from main
+
+  # If release/* is a protected branch, the push above is rejected. Either grant
+  # this workflow's identity an exception, or drop --no-push here and have a
+  # human land the branch:
+  #
+  #   - run: pickle sync --target "$RELEASE_BRANCH" --from main --no-push

@@ -1,0 +1,908 @@
+#!/usr/bin/env bash
+#
+# pickle — a git-native release backport tool.
+#
+# Cherry-picks hotfixes from a trunk branch onto a release branch, using nothing
+# but git. No hosting-platform API, no config file, no state files: the same
+# command runs identically on GitHub Actions, GitLab CI, Jenkins or a laptop.
+#
+# https://github.com/  (see README.md)
+
+set -euo pipefail
+
+PICKLE_VERSION="1.0.0"
+
+if [[ -z ${BASH_VERSINFO[0]:-} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "pickle: requires bash 4 or newer (found ${BASH_VERSION:-unknown})" >&2
+    exit 3
+fi
+
+# Exit codes. Documented in README; CI depends on them.
+readonly EX_OK=0          # everything selected was landed (or nothing to do)
+readonly EX_FAIL=1        # a commit conflicted and needs a human
+readonly EX_USAGE=2       # bad invocation
+readonly EX_PREFLIGHT=3   # the repo or environment is not in a state we can work in
+
+readonly PICKLE_NAME="pickle"
+readonly PICKLE_EMAIL="noreply@pickle.invalid"
+
+# ---------------------------------------------------------------------------
+# Options. Every one is settable by flag or PICKLE_-prefixed environment
+# variable; flag wins. There is deliberately no config file.
+# ---------------------------------------------------------------------------
+
+REMOTE="${PICKLE_REMOTE:-origin}"
+TARGET="${PICKLE_TARGET:-}"
+FROM="${PICKLE_FROM:-}"
+TYPES="${PICKLE_TYPES:-fix}"
+INCLUDE="${PICKLE_INCLUDE:-}"
+EXCLUDE="${PICKLE_EXCLUDE:-}"
+REASON=""
+
+FIRST_PARENT=0
+ALLOW_BREAKING=0
+KEEP_GOING=0
+DRY_RUN=0
+NO_PUSH=0
+NO_FETCH=0
+
+COMMAND=""
+declare -a ARGV_SHAS=()
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_DIM="" C_BOLD=""
+
+setup_colors() {
+    [[ -n ${NO_COLOR:-} ]] && return 0
+    [[ -t 1 ]] || return 0
+    command -v tput >/dev/null 2>&1 || return 0
+    local n
+    n=$(tput colors 2>/dev/null || echo 0)
+    [[ $n -ge 8 ]] || return 0
+    C_RESET=$(tput sgr0)     ; C_RED=$(tput setaf 1)
+    C_GREEN=$(tput setaf 2)  ; C_YELLOW=$(tput setaf 3)
+    C_DIM=$(tput dim || true); C_BOLD=$(tput bold)
+}
+
+# Diagnostics go to stderr; the report is data and goes to stdout.
+warn() { printf '%spickle: %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+die()  { local code=$1; shift; printf '%spickle: %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit "$code"; }
+
+usage() {
+    cat <<'HELPTEXT'
+pickle — cherry-pick hotfixes from trunk onto a release branch, using only git.
+
+USAGE
+    pickle sync   --target BRANCH [--from BRANCH] [selection] [options]
+    pickle status --target BRANCH [--from BRANCH] [selection]
+    pickle cut    --target BRANCH [--from BRANCH] [options]
+    pickle pick   --target BRANCH (SHA... | -)
+    pickle skip   --target BRANCH SHA... [--reason TEXT]
+
+COMMANDS
+    sync      Pick every trunk commit matching the selection that is not already
+              on the release branch, then push. The workhorse; safe to run on a
+              schedule, and idempotent.
+    status    Show what sync would do. Never mutates anything.
+    cut       Create the release branch from trunk and push it. Run once, at
+              feature freeze.
+    pick      Cherry-pick specific commits, ignoring the selection filter.
+              Pass "-" to read SHAs from stdin, one per line.
+    skip      Record that a commit is deliberately not being backported, so
+              sync stops proposing it. Writes an empty commit carrying a
+              "(cherry picked from commit ...)" trailer.
+
+SELECTION
+    --types LIST        Conventional-commit types to pick, comma separated.
+                        Default: fix
+    --include REGEX     Match commit subjects with this ERE instead of --types.
+                        For teams that do not use conventional commits.
+    --exclude REGEX     Reject subjects matching this ERE, applied after include.
+    --first-parent      Walk trunk's first-parent line and pick merge commits
+                        with -m 1. For repos that merge rather than squash.
+    --allow-breaking    Also pick breaking changes ("fix!:", "BREAKING CHANGE:"),
+                        which are excluded by default.
+
+OPTIONS
+    --target BRANCH     Release branch to pick onto. Required. A literal branch
+                        name; pickle assumes no naming convention.
+    --from BRANCH       Trunk to pick from. Default: origin/HEAD, else main/master.
+    --remote NAME       Default: origin
+    --keep-going        On conflict, skip that commit and continue with the rest.
+                        Off by default: stopping preserves commit order, so a fix
+                        can never land without a prerequisite it depends on.
+    --dry-run           Report what would happen; change nothing.
+    --no-push           Land commits locally but do not push.
+    --no-fetch          Skip the initial fetch; work with local refs only.
+    --reason TEXT       Message body for "skip".
+    -h, --help          This text.
+    -V, --version       Print version.
+
+ENVIRONMENT
+    PICKLE_TARGET, PICKLE_FROM, PICKLE_REMOTE, PICKLE_TYPES, PICKLE_INCLUDE,
+    PICKLE_EXCLUDE  — defaults for the matching flags.
+    NO_COLOR        — disable colour.
+    GITHUB_STEP_SUMMARY — if set, the report is also appended there as markdown.
+
+EXIT CODES
+    0  success       1  conflict needing a human
+    2  usage error   3  repo/environment preflight failure
+
+EXAMPLES
+    # At feature freeze:
+    pickle cut --target release/1.2 --from main
+
+    # Then, nightly or on every merge to trunk:
+    pickle sync --target release/1.2 --from main
+
+    # A team that does not use conventional commits:
+    pickle sync --target release/1.2 --include '^\[HOTFIX\]'
+
+    # Any git log invocation becomes a selection rule:
+    git log --format=%H --grep=URGENT main | pickle pick --target release/1.2 -
+HELPTEXT
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+parse_args() {
+    case "${1:-}" in
+        sync|status|cut|pick|skip) COMMAND=$1; shift ;;
+        -h|--help|help)            usage; exit $EX_OK ;;
+        -V|--version)              printf 'pickle %s\n' "$PICKLE_VERSION"; exit $EX_OK ;;
+        "")                        usage >&2; exit $EX_USAGE ;;
+        *)                         die "$EX_USAGE" "unknown command '$1' (try: pickle --help)" ;;
+    esac
+
+    # Normalise --flag=value into --flag value so each flag is handled once.
+    local a
+    local -a norm=()
+    for a in "$@"; do
+        case $a in
+            --*=*) norm+=( "${a%%=*}" "${a#*=}" ) ;;
+            *)     norm+=( "$a" ) ;;
+        esac
+    done
+    if (( ${#norm[@]} )); then set -- "${norm[@]}"; else set --; fi
+
+    while (( $# )); do
+        case $1 in
+            --target)         [[ $# -ge 2 ]] || die "$EX_USAGE" "--target needs a value";  TARGET=$2;  shift 2 ;;
+            --from)           [[ $# -ge 2 ]] || die "$EX_USAGE" "--from needs a value";    FROM=$2;    shift 2 ;;
+            --remote)         [[ $# -ge 2 ]] || die "$EX_USAGE" "--remote needs a value";  REMOTE=$2;  shift 2 ;;
+            --types)          [[ $# -ge 2 ]] || die "$EX_USAGE" "--types needs a value";   TYPES=$2;   shift 2 ;;
+            --include)        [[ $# -ge 2 ]] || die "$EX_USAGE" "--include needs a value"; INCLUDE=$2; shift 2 ;;
+            --exclude)        [[ $# -ge 2 ]] || die "$EX_USAGE" "--exclude needs a value"; EXCLUDE=$2; shift 2 ;;
+            --reason)         [[ $# -ge 2 ]] || die "$EX_USAGE" "--reason needs a value";  REASON=$2;  shift 2 ;;
+            --first-parent)   FIRST_PARENT=1;   shift ;;
+            --allow-breaking) ALLOW_BREAKING=1; shift ;;
+            --keep-going)     KEEP_GOING=1;     shift ;;
+            --dry-run)        DRY_RUN=1;        shift ;;
+            --no-push)        NO_PUSH=1;        shift ;;
+            --no-fetch)       NO_FETCH=1;       shift ;;
+            -h|--help)        usage; exit $EX_OK ;;
+            -V|--version)     printf 'pickle %s\n' "$PICKLE_VERSION"; exit $EX_OK ;;
+            --)               shift; while (( $# )); do ARGV_SHAS+=( "$1" ); shift; done ;;
+            -)                ARGV_SHAS+=( "-" ); shift ;;
+            -*)               die "$EX_USAGE" "unknown option '$1'" ;;
+            *)                ARGV_SHAS+=( "$1" ); shift ;;
+        esac
+    done
+
+    [[ -n $TARGET ]] || die "$EX_USAGE" "--target is required (the release branch to pick onto)"
+
+    # status never mutates, whatever else was asked for.
+    [[ $COMMAND == status ]] && { DRY_RUN=1; NO_PUSH=1; }
+
+    case $COMMAND in
+        pick) (( ${#ARGV_SHAS[@]} )) || die "$EX_USAGE" "pick needs commits (SHAs, or '-' to read stdin)" ;;
+        skip) (( ${#ARGV_SHAS[@]} )) || die "$EX_USAGE" "skip needs at least one commit" ;;
+        *)    (( ${#ARGV_SHAS[@]} )) && die "$EX_USAGE" "$COMMAND takes no positional arguments" ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Preflight
+#
+# Each check here is a real CI failure mode. Handling them costs a few lines and
+# saves every new user an afternoon of debugging git rather than their release.
+# ---------------------------------------------------------------------------
+
+HAVE_REMOTE=0
+
+preflight() {
+    git rev-parse --git-dir >/dev/null 2>&1 \
+        || die "$EX_PREFLIGHT" "not a git repository"
+
+    # CI checkouts have no committer identity, and cherry-pick refuses to run
+    # without one. Set only GIT_COMMITTER_*: cherry-pick takes the author from
+    # the commit being picked, and exporting GIT_AUTHOR_* would silently rewrite
+    # authorship of every backported commit.
+    if ! git config user.email >/dev/null 2>&1 || ! git config user.name >/dev/null 2>&1; then
+        export GIT_COMMITTER_NAME="$PICKLE_NAME"
+        export GIT_COMMITTER_EMAIL="$PICKLE_EMAIL"
+    fi
+
+    if git remote get-url "$REMOTE" >/dev/null 2>&1; then
+        HAVE_REMOTE=1
+    else
+        warn "no remote '$REMOTE'; working locally and not pushing"
+        NO_PUSH=1
+    fi
+
+    local seq
+    seq=$(git rev-parse --git-path CHERRY_PICK_HEAD)
+    if [[ -e $seq ]]; then
+        die "$EX_PREFLIGHT" "a cherry-pick is already in progress; finish it (git cherry-pick --continue) or abandon it (git cherry-pick --abort)"
+    fi
+
+    if git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        git update-index -q --refresh >/dev/null 2>&1 || true
+        if ! git diff-index --quiet HEAD --; then
+            die "$EX_PREFLIGHT" "working tree has uncommitted changes; commit or stash them first"
+        fi
+    fi
+
+    # actions/checkout clones at depth 1 by default, which makes cherry-pick
+    # impossible. Recover rather than making the user debug it.
+    if (( HAVE_REMOTE )) && [[ $(git rev-parse --is-shallow-repository 2>/dev/null || echo false) == true ]]; then
+        warn "shallow clone detected; deepening (set 'fetch-depth: 0' on your checkout step to avoid paying this every run)"
+        git fetch --quiet --unshallow "$REMOTE" \
+            || die "$EX_PREFLIGHT" "could not deepen the shallow clone"
+    elif (( HAVE_REMOTE && ! NO_FETCH )); then
+        git fetch --quiet "$REMOTE" \
+            || warn "fetch from '$REMOTE' failed; continuing with the refs already local"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Ref resolution
+# ---------------------------------------------------------------------------
+
+# Trunk, when --from was not given: whatever the remote calls its default
+# branch, then the conventional names, preferring the remote-tracking ref
+# because in CI the local branch may not exist at all.
+default_from() {
+    local d b
+    if d=$(git symbolic-ref --quiet --short "refs/remotes/$REMOTE/HEAD" 2>/dev/null); then
+        printf '%s\n' "$d"; return 0
+    fi
+    for b in main master trunk; do
+        if git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b" >/dev/null; then
+            printf '%s\n' "$REMOTE/$b"; return 0
+        fi
+    done
+    for b in main master trunk; do
+        if git rev-parse --verify --quiet "refs/heads/$b" >/dev/null; then
+            printf '%s\n' "$b"; return 0
+        fi
+    done
+    die "$EX_USAGE" "could not work out which branch is trunk; pass --from"
+}
+
+# A readable ref for the target branch: the local branch if we have it, else the
+# remote-tracking one. Lets status and --dry-run work without touching HEAD.
+target_ref() {
+    if git rev-parse --verify --quiet "refs/heads/$TARGET" >/dev/null; then
+        printf 'refs/heads/%s\n' "$TARGET"
+    elif git rev-parse --verify --quiet "refs/remotes/$REMOTE/$TARGET" >/dev/null; then
+        printf 'refs/remotes/%s/%s\n' "$REMOTE" "$TARGET"
+    else
+        return 1
+    fi
+}
+
+# Get onto the release branch, creating a local tracking branch if we only have
+# the remote one, and fast-forwarding if the remote has moved ahead.
+ORIG_BRANCH=""
+
+# Leaving someone on a branch they did not ask to be on is a small rudeness that
+# a scheduled job never notices and a person always does.
+# shellcheck disable=SC2329  # invoked via trap
+restore_branch() {
+    [[ -n $ORIG_BRANCH ]] || return 0
+    [[ $ORIG_BRANCH != "$TARGET" ]] || return 0
+    git rev-parse --verify --quiet "refs/heads/$ORIG_BRANCH" >/dev/null || return 0
+    git switch --quiet "$ORIG_BRANCH" 2>/dev/null || true
+}
+
+checkout_target() {
+    local cur
+    cur=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+    ORIG_BRANCH=$cur
+    trap restore_branch EXIT
+
+    if git rev-parse --verify --quiet "refs/heads/$TARGET" >/dev/null; then
+        [[ $cur == "$TARGET" ]] || git switch --quiet "$TARGET"
+        if git rev-parse --verify --quiet "refs/remotes/$REMOTE/$TARGET" >/dev/null; then
+            git merge --ff-only --quiet "refs/remotes/$REMOTE/$TARGET" 2>/dev/null \
+                || die "$EX_PREFLIGHT" "local '$TARGET' has diverged from '$REMOTE/$TARGET'; reconcile them before running pickle"
+        fi
+    elif git rev-parse --verify --quiet "refs/remotes/$REMOTE/$TARGET" >/dev/null; then
+        git switch --quiet --create "$TARGET" --track "refs/remotes/$REMOTE/$TARGET"
+    else
+        die "$EX_PREFLIGHT" "release branch '$TARGET' does not exist; create it with: pickle cut --target $TARGET"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Selection
+#
+# Two independent questions per candidate:
+#   1. Does its subject say it belongs in a release? (the type/regex filter)
+#   2. Is it already on the release branch?          (patch-id, then -x trailer)
+# ---------------------------------------------------------------------------
+
+SEP=$'\x1f'   # non-whitespace: empty fields must survive `read`
+
+declare -A TARGET_PATCH_IDS=()
+declare -A TARGET_XREFS=()
+declare -a PLAN=()
+EXPLICIT=0   # "pick" bypasses the subject filter; explicit means explicit
+
+include_re() {
+    if [[ -n $INCLUDE ]]; then printf '%s' "$INCLUDE"; return 0; fi
+    local alt=${TYPES//,/|}
+    alt=${alt// /}
+    [[ -n $alt ]] || die "$EX_USAGE" "--types is empty"
+    # The optional "!" is matched here so that --allow-breaking works by
+    # relaxing the exclusion below rather than by rewriting this pattern.
+    printf '^(%s)(\([^)]*\))?!?: ' "$alt"
+}
+
+# The diff of a commit, hashed so that it can be compared across cherry-picks.
+# patch-id normalises whitespace and line numbers and ignores the message,
+# author, date and SHA, so a hand cherry-pick made with no -x, a rewritten
+# message and a different author still hashes identically to its original.
+# --first-parent makes this work for merge commits too: it yields the same diff
+# that "cherry-pick -m 1" would apply.
+patch_id_of() {
+    # -m is required to make diff-tree expand a merge at all; without it a merge
+    # commit produces no diff and therefore no patch-id. --first-parent then
+    # picks the one diff that matters: the same one "cherry-pick -m 1" applies.
+    git diff-tree -p -m --first-parent --no-commit-id --no-renames --root "$1" 2>/dev/null \
+        | git patch-id --stable 2>/dev/null \
+        | awk '{ print $1; exit }'
+}
+
+load_target_patch_ids() {
+    local range=$1 pid _rest
+    while read -r pid _rest; do
+        [[ -n $pid ]] && TARGET_PATCH_IDS[$pid]=1
+    done < <(git log -p --no-merges --no-renames --format='commit %H' "$range" 2>/dev/null \
+             | git patch-id --stable 2>/dev/null || true)
+}
+
+# Patch-id misses exactly one case: someone resolved a conflict by hand, so the
+# diff that landed differs from the original. That is what the -x trailer is
+# for, and it is the only thing pickle asks a human to do — in the very message
+# that tells them a conflict needs resolving.
+load_target_xrefs() {
+    local range=$1 sha full
+    while read -r sha; do
+        [[ -n $sha ]] || continue
+        if full=$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null); then
+            TARGET_XREFS[$full]=1
+        else
+            TARGET_XREFS[$sha]=1   # abbreviated and not an object we have
+        fi
+    done < <(git log --format=%B "$range" 2>/dev/null \
+             | sed -n 's/^[[:space:]]*(cherry picked from commit \([0-9a-f]\{7,40\}\)).*/\1/p')
+}
+
+is_xref() {
+    local sha=$1 k
+    (( ${#TARGET_XREFS[@]} )) || return 1
+    [[ -n ${TARGET_XREFS[$sha]:-} ]] && return 0
+    for k in "${!TARGET_XREFS[@]}"; do
+        [[ ${#k} -lt 40 && $sha == "$k"* ]] && return 0
+    done
+    return 1
+}
+
+is_breaking() {
+    local sha=$1 subject
+    subject=$(git log -1 --format=%s "$sha")
+    [[ $subject =~ ^[a-zA-Z]+(\([^\)]*\))?!: ]] && return 0
+    git log -1 --format=%B "$sha" | grep -qE '^BREAKING[ -]CHANGE:' && return 0
+    return 1
+}
+
+# Sets ACTION and REASON for one candidate.
+ACTION="" ; REASON_TEXT=""
+classify() {
+    local sha=$1 subject=$2 inc pid
+    ACTION="" ; REASON_TEXT=""
+
+    if (( ! EXPLICIT )); then
+        inc=$(include_re)
+        if ! printf '%s\n' "$subject" | grep -qE "$inc"; then
+            ACTION=SKIP ; REASON_TEXT="type not selected" ; return 0
+        fi
+        if [[ -n $EXCLUDE ]] && printf '%s\n' "$subject" | grep -qE "$EXCLUDE"; then
+            ACTION=SKIP ; REASON_TEXT="excluded by --exclude" ; return 0
+        fi
+        if (( ! ALLOW_BREAKING )) && is_breaking "$sha"; then
+            ACTION=SKIP ; REASON_TEXT="breaking change; --allow-breaking to include" ; return 0
+        fi
+    fi
+
+    pid=$(patch_id_of "$sha")
+    if [[ -n $pid && -n ${TARGET_PATCH_IDS[$pid]:-} ]]; then
+        ACTION=SKIP ; REASON_TEXT="already present (patch-id)" ; return 0
+    fi
+    if is_xref "$sha"; then
+        ACTION=SKIP ; REASON_TEXT="already backported by hand (-x trailer)" ; return 0
+    fi
+
+    ACTION=PICK ; REASON_TEXT=""
+    return 0
+}
+
+# Everything on trunk that is not yet on the release branch, oldest first.
+# Order matters: applying out of order can land a fix ahead of a change it
+# depends on, which is the failure mode that produces a clean-looking pick and
+# a broken release.
+candidate_shas() {
+    local tgt_ref=$1 from_ref=$2
+    local -a walk=( --no-merges )
+    (( FIRST_PARENT )) && walk=( --first-parent )
+    git rev-list --reverse --topo-order "${walk[@]}" "$tgt_ref..$from_ref"
+}
+
+build_plan() {
+    local tgt_ref=$1 from_ref=$2 ; shift 2
+    local -a shas=( "$@" )
+    local base sha subject
+
+    base=$(git merge-base "$tgt_ref" "$from_ref" 2>/dev/null) \
+        || die "$EX_PREFLIGHT" "'$TARGET' and '$FROM' have no common ancestor"
+
+    load_target_patch_ids "$base..$tgt_ref"
+    load_target_xrefs "$base..$tgt_ref"
+
+    if (( ! ${#shas[@]} )); then
+        mapfile -t shas < <(candidate_shas "$tgt_ref" "$from_ref")
+    fi
+
+    for sha in "${shas[@]}"; do
+        [[ -n $sha ]] || continue
+        subject=$(git log -1 --format=%s "$sha")
+        classify "$sha" "$subject"
+        PLAN+=( "${sha}${SEP}${ACTION}${SEP}${REASON_TEXT}${SEP}${subject}" )
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Applying
+# ---------------------------------------------------------------------------
+
+declare -A OUTCOME=()          # sha -> picked | conflict | empty | not-attempted
+CONFLICT_FILES=""
+declare -a CONFLICTS=()        # "sha<TAB>subject<TAB>files"
+PICKED_COUNT=0
+
+is_merge() {
+    local parents
+    parents=$(git show -s --format=%P "$1")
+    [[ $(printf '%s\n' "$parents" | wc -w) -gt 1 ]]
+}
+
+# 0 = landed, 1 = conflicted, 2 = nothing left to apply.
+do_one_pick() {
+    local sha=$1 rc=0 files
+    local -a cmd=( cherry-pick -x )
+
+    is_merge "$sha" && cmd+=( -m 1 )
+
+    git "${cmd[@]}" "$sha" >/dev/null 2>&1 || rc=$?
+    (( rc == 0 )) && return 0
+
+    files=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+
+    if [[ -z $files ]]; then
+        # The commit had nothing left to add — its change is already in the
+        # tree in a form patch-id could not recognise. Not an error.
+        git cherry-pick --skip >/dev/null 2>&1 \
+            || git cherry-pick --quit >/dev/null 2>&1 || true
+        return 2
+    fi
+
+    CONFLICT_FILES=$files
+    # Each pick is its own one-commit sequence, so --abort rewinds precisely
+    # this commit and leaves everything landed earlier in the run untouched.
+    # The branch is left clean; conflict markers can never reach the remote.
+    git cherry-pick --abort >/dev/null 2>&1 \
+        || git cherry-pick --quit >/dev/null 2>&1 || true
+    return 1
+}
+
+run_plan() {
+    local line sha action reason subject rc stopped=0
+
+    for line in "${PLAN[@]}"; do
+        IFS=$SEP read -r sha action reason subject <<<"$line"
+        [[ $action == PICK ]] || continue
+
+        if (( stopped )); then
+            OUTCOME[$sha]="not-attempted"
+            continue
+        fi
+
+        rc=0 ; do_one_pick "$sha" || rc=$?
+        case $rc in
+            0) OUTCOME[$sha]="picked" ; PICKED_COUNT=$(( PICKED_COUNT + 1 )) ;;
+            2) OUTCOME[$sha]="empty" ;;
+            1) OUTCOME[$sha]="conflict"
+               CONFLICTS+=( "${sha}${SEP}${subject}${SEP}${CONFLICT_FILES}" )
+               (( KEEP_GOING )) || stopped=1 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+fit() {
+    local s=$1 w=$2
+    if (( ${#s} > w )); then printf '%s…' "${s:0:w-1}"
+    else printf '%-*s' "$w" "$s"
+    fi
+}
+
+print_report() {
+    local line sha action reason subject width=0 status colour
+    local picked=0 skipped=0 conflicted=0 pending=0
+
+    (( ${#PLAN[@]} )) || { printf '  nothing on %s that is not already on %s\n' "$FROM" "$TARGET"; return 0; }
+
+    for line in "${PLAN[@]}"; do
+        subject=${line##*"$SEP"}
+        (( ${#subject} > width )) && width=${#subject}
+    done
+    (( width > 58 )) && width=58
+    (( width < 20 )) && width=20
+
+    for line in "${PLAN[@]}"; do
+        IFS=$SEP read -r sha action reason subject <<<"$line"
+        colour=""
+        if [[ $action == PICK ]]; then
+            case "${OUTCOME[$sha]:-}" in
+                picked)        status="picked"                       ; colour=$C_GREEN  ; (( ++picked )) ;;
+                empty)         status="skip (nothing left to apply)" ; colour=$C_DIM    ; (( ++skipped )) ;;
+                conflict)      status="CONFLICT — needs a human"     ; colour=$C_RED    ; (( ++conflicted )) ;;
+                not-attempted) status="not attempted (run stopped above)" ; colour=$C_YELLOW ; (( ++pending )) ;;
+                *)             status="would pick"                   ; colour=$C_GREEN  ; (( ++picked )) ;;
+            esac
+        else
+            status="skip ($reason)" ; colour=$C_DIM ; (( ++skipped ))
+        fi
+        printf '  %s  %s  %s→ %s%s\n' \
+            "$(git rev-parse --short=8 "$sha")" "$(fit "$subject" "$width")" \
+            "$colour" "$status" "$C_RESET"
+    done
+
+    printf '\n'
+    if (( DRY_RUN )); then
+        printf '  %s would pick, %s skipped%s\n' "$picked" "$skipped" \
+            "$( (( conflicted )) && printf ', %s conflicting' "$conflicted" || true )"
+    else
+        printf '  %s%s picked%s, %s skipped' "$C_BOLD" "$picked" "$C_RESET" "$skipped"
+        (( conflicted )) && printf ', %s%s conflicted%s' "$C_RED" "$conflicted" "$C_RESET"
+        (( pending ))    && printf ', %s not attempted' "$pending"
+        printf '\n'
+    fi
+}
+
+print_conflicts() {
+    (( ${#CONFLICTS[@]} )) || return 0
+    local entry sha subject files f
+
+    printf '\n'
+    for entry in "${CONFLICTS[@]}"; do
+        IFS=$SEP read -r sha subject files <<<"$entry"
+        printf '  %s✗ conflict picking %s  %s%s\n' \
+            "$C_RED" "$(git rev-parse --short=8 "$sha")" "$subject" "$C_RESET"
+        while read -r f; do [[ -n $f ]] && printf '      %s\n' "$f"; done <<<"$files"
+    done
+
+    # The one place a human has to do something. Give them the exact commands
+    # rather than a rule to remember: cherry-pick --continue carries the -x
+    # trailer through the resolution, which is what stops the next run from
+    # proposing this commit all over again.
+    IFS=$SEP read -r sha subject files <<<"${CONFLICTS[0]}"
+    cat <<EOF
+
+  the branch was left clean; nothing half-applied was pushed.
+
+  resolve it locally:
+    git fetch $REMOTE
+    git switch $TARGET
+    git cherry-pick -x $(git rev-parse --short=8 "$sha")
+    # fix the conflict, then:
+    git add -A && git cherry-pick --continue
+    git push $REMOTE $TARGET
+
+  keep the -x flag: it records where the commit came from, which is how the
+  next run knows not to try again.
+EOF
+}
+
+# Free CI integration, still without touching a platform API.
+# shellcheck disable=SC2016  # the backticks are markdown, not substitution
+write_step_summary() {
+    [[ -n ${GITHUB_STEP_SUMMARY:-} ]] || return 0
+    [[ -w ${GITHUB_STEP_SUMMARY} || ! -e ${GITHUB_STEP_SUMMARY} ]] || return 0
+    local line sha action reason subject status
+    {
+        printf '### pickle: `%s` → `%s`\n\n' "$FROM" "$TARGET"
+        printf '| commit | subject | result |\n|---|---|---|\n'
+        for line in "${PLAN[@]}"; do
+            IFS=$SEP read -r sha action reason subject <<<"$line"
+            if [[ $action == PICK ]]; then
+                status="${OUTCOME[$sha]:-would pick}"
+            else
+                status="skip — $reason"
+            fi
+            printf '| `%s` | %s | %s |\n' \
+                "$(git rev-parse --short=8 "$sha")" "${subject//|/\\|}" "$status"
+        done
+        printf '\n'
+    } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+FROM_REF=""
+
+# The remote-tracking ref is the source of truth for what is actually on trunk:
+# in CI the local branch usually does not exist at all, and locally it may be
+# stale. Prefer it, but say so when the local branch disagrees.
+resolve_from() {
+    [[ -n $FROM ]] || FROM=$(default_from)
+    local rr="refs/remotes/$REMOTE/$FROM"
+    if git rev-parse --verify --quiet "${rr}^{commit}" >/dev/null; then
+        if git rev-parse --verify --quiet "refs/heads/${FROM}^{commit}" >/dev/null \
+           && [[ $(git rev-parse "refs/heads/$FROM") != $(git rev-parse "$rr") ]]; then
+            warn "local '$FROM' differs from '$REMOTE/$FROM'; using '$REMOTE/$FROM' as trunk"
+        fi
+        FROM_REF=$rr
+    elif git rev-parse --verify --quiet "${FROM}^{commit}" >/dev/null; then
+        FROM_REF=$FROM
+    else
+        die "$EX_USAGE" "trunk branch '$FROM' does not resolve to a commit"
+    fi
+}
+
+# Picking a branch onto itself would be a no-op at best and confusing at worst.
+require_distinct() {
+    local a b
+    a=$(git rev-parse --symbolic-full-name "$FROM_REF" 2>/dev/null || echo "$FROM_REF")
+    b=$(git rev-parse --symbolic-full-name "refs/heads/$TARGET" 2>/dev/null || echo "$TARGET")
+    [[ $a != "$b" ]] || die "$EX_USAGE" "--target and --from are the same branch ($TARGET)"
+    [[ $FROM != "$TARGET" ]] || die "$EX_USAGE" "--target and --from are the same branch ($TARGET)"
+}
+
+require_target() {
+    target_ref 2>/dev/null \
+        || die "$EX_PREFLIGHT" "release branch '$TARGET' does not exist; create it with: pickle cut --target $TARGET --from $FROM"
+}
+
+header() {
+    printf '\n%spickle%s  %s → %s%s\n\n' \
+        "$C_BOLD" "$C_RESET" "$FROM" "$TARGET" \
+        "$( (( DRY_RUN )) && printf '  [dry run]' || true )"
+}
+
+maybe_push() {
+    (( DRY_RUN )) && return 0
+    (( PICKED_COUNT )) || return 0
+    if (( ! HAVE_REMOTE )); then
+        printf '  not pushed (no remote %s); the commits are on your local %s\n' "$REMOTE" "$TARGET"
+        return 0
+    fi
+    if (( NO_PUSH )); then
+        printf '  not pushed (--no-push); push with: git push %s %s\n' "$REMOTE" "$TARGET"
+        return 0
+    fi
+    git push --quiet "$REMOTE" "$TARGET" \
+        || die "$EX_FAIL" "picked $PICKED_COUNT commit(s) locally but the push to $REMOTE/$TARGET failed"
+    printf '  pushed %s to %s\n' "$TARGET" "$REMOTE"
+}
+
+finish() {
+    write_step_summary
+    (( ${#CONFLICTS[@]} )) && exit $EX_FAIL
+    exit $EX_OK
+}
+
+cmd_sync() {
+    resolve_from
+    require_target >/dev/null
+    require_distinct
+
+    if (( DRY_RUN )); then
+        # status and --dry-run read the branch without ever checking it out, so
+        # they cannot disturb a working tree or a running build.
+        build_plan "$(target_ref)" "$FROM_REF"
+        header
+        print_report
+        finish
+    fi
+
+    checkout_target
+    build_plan "refs/heads/$TARGET" "$FROM_REF"
+    header
+    run_plan
+    print_report
+    maybe_push
+    print_conflicts
+    finish
+}
+
+# Explicit SHAs from argv or stdin, resolved and ordered oldest-first. Applying
+# them in the order they were typed would be wrong for the common case of
+# piping `git log`, which prints newest first.
+resolve_argv_shas() {
+    local -a raw=() full=()
+    local s line resolved
+
+    for s in "${ARGV_SHAS[@]}"; do
+        if [[ $s == "-" ]]; then
+            while read -r line || [[ -n $line ]]; do
+                line=${line%%[[:space:]]*}
+                [[ -n $line ]] && raw+=( "$line" )
+            done
+        else
+            raw+=( "$s" )
+        fi
+    done
+
+    (( ${#raw[@]} )) || die "$EX_USAGE" "no commits given"
+
+    for s in "${raw[@]}"; do
+        resolved=$(git rev-parse --verify --quiet "${s}^{commit}") \
+            || die "$EX_USAGE" "not a commit in this repository: $s"
+        full+=( "$resolved" )
+    done
+
+    git rev-list --no-walk=sorted --reverse "${full[@]}" 2>/dev/null \
+        || printf '%s\n' "${full[@]}"
+}
+
+cmd_pick() {
+    EXPLICIT=1
+    resolve_from
+    require_target >/dev/null
+    require_distinct
+
+    local -a shas=()
+    mapfile -t shas < <(resolve_argv_shas)
+
+    if (( DRY_RUN )); then
+        build_plan "$(target_ref)" "$FROM_REF" "${shas[@]}"
+        header
+        print_report
+        finish
+    fi
+
+    checkout_target
+    build_plan "refs/heads/$TARGET" "$FROM_REF" "${shas[@]}"
+    header
+    run_plan
+    print_report
+    maybe_push
+    print_conflicts
+    finish
+}
+
+cmd_cut() {
+    resolve_from
+    [[ $FROM != "$TARGET" ]] || die "$EX_USAGE" "--target and --from are the same branch ($TARGET)"
+
+    if target_ref >/dev/null 2>&1; then
+        die "$EX_PREFLIGHT" "'$TARGET' already exists; pickle cut is for creating a new release branch"
+    fi
+
+    local at
+    at=$(git rev-parse --short=8 "$FROM_REF")
+
+    if (( DRY_RUN )); then
+        printf '\n  would create %s at %s (%s)\n\n' "$TARGET" "$at" "$FROM"
+        exit $EX_OK
+    fi
+
+    git branch --no-track "$TARGET" "$FROM_REF"
+    printf '\n  %s✓%s created %s at %s (%s)\n' "$C_GREEN" "$C_RESET" "$TARGET" "$at" "$FROM"
+
+    if (( NO_PUSH )); then
+        printf '  not pushed (--no-push); push with: git push -u %s %s\n\n' "$REMOTE" "$TARGET"
+    else
+        git push --quiet --set-upstream "$REMOTE" "$TARGET" \
+            || die "$EX_FAIL" "created $TARGET locally but the push to $REMOTE failed"
+        printf '  pushed %s to %s\n\n' "$TARGET" "$REMOTE"
+    fi
+    exit $EX_OK
+}
+
+# Records a deliberate decision not to backport, using the same trailer the
+# detector already reads. No new state mechanism, no notes ref, no config file
+# — and it leaves an auditable line in the release branch's history saying a
+# human decided this on purpose.
+cmd_skip() {
+    resolve_from
+    require_target >/dev/null
+    require_distinct
+    checkout_target
+
+    # So that skipping something already recorded is a no-op rather than a
+    # second empty commit saying the same thing.
+    local base
+    base=$(git merge-base "refs/heads/$TARGET" "$FROM_REF" 2>/dev/null || true)
+    [[ -n $base ]] && load_target_xrefs "${base}..refs/heads/$TARGET"
+
+    if ! git config user.email >/dev/null 2>&1 || ! git config user.name >/dev/null 2>&1; then
+        export GIT_AUTHOR_NAME="$PICKLE_NAME"
+        export GIT_AUTHOR_EMAIL="$PICKLE_EMAIL"
+    fi
+
+    local -a shas=()
+    mapfile -t shas < <(resolve_argv_shas)
+
+    local sha short subject n=0
+    printf '\n'
+    for sha in "${shas[@]}"; do
+        short=$(git rev-parse --short=8 "$sha")
+        subject=$(git log -1 --format=%s "$sha")
+
+        if is_xref "$sha"; then
+            printf '  %s  %s → already recorded\n' "$short" "$subject"
+            continue
+        fi
+
+        if (( DRY_RUN )); then
+            printf '  %s  %s → would record as skipped\n' "$short" "$subject"
+            continue
+        fi
+
+        git commit --quiet --allow-empty -m "chore: skip backport of $short
+
+${REASON:-Deliberately not backported to $TARGET.}
+
+(cherry picked from commit $sha)"
+        printf '  %s  %s → recorded as skipped\n' "$short" "$subject"
+        n=$(( n + 1 ))
+    done
+    printf '\n'
+
+    PICKED_COUNT=$n
+    maybe_push
+    exit $EX_OK
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    setup_colors
+    parse_args "$@"
+    preflight
+
+    case $COMMAND in
+        sync|status) cmd_sync ;;
+        pick)        cmd_pick ;;
+        cut)         cmd_cut  ;;
+        skip)        cmd_skip ;;
+        *)           die "$EX_USAGE" "unhandled command: $COMMAND" ;;
+    esac
+}
+
+main "$@"

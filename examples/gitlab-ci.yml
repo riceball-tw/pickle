@@ -1,0 +1,26 @@
+# Backport hotfixes from trunk onto a release branch.
+#
+# Needs a token that can push to the release branch. A Project Access Token
+# with write_repository, stored as the masked CI variable PICKLE_TOKEN, is
+# enough; CI_JOB_TOKEN cannot push.
+
+backport:
+  stage: .post
+  image: alpine:3.20
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    GIT_DEPTH: 0                  # full history; cherry-pick needs it
+    RELEASE_BRANCH: release/1.2
+  before_script:
+    - apk add --no-cache bash git curl
+    - curl -fsSL https://example.com/pickle -o /usr/local/bin/pickle
+    - chmod +x /usr/local/bin/pickle
+    - git config user.name  "pickle"
+    - git config user.email "noreply@pickle.invalid"
+    - git remote set-url origin
+        "https://oauth2:${PICKLE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+  script:
+    # Exits 1 on conflict, which fails the job on purpose.
+    - pickle sync --target "$RELEASE_BRANCH" --from "$CI_DEFAULT_BRANCH"
