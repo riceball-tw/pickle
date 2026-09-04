@@ -17,13 +17,21 @@ jobs:
           bash --version | head -1
           git --version
 
+      # Pinned deliberately. Different shellcheck versions emit different
+      # advisories, so installing whatever the runner image happens to ship
+      # turns an image bump into a CI failure with no code change behind it.
       - name: shellcheck
+        env:
+          SHELLCHECK_VERSION: v0.11.0
         run: |
-          command -v shellcheck >/dev/null || {
-            sudo apt-get update -qq && sudo apt-get install -y shellcheck
-          }
-          shellcheck pickle
-          shellcheck -e SC1090,SC1091 test/run.sh test/cases/*.sh
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sc"
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$RUNNER_TEMP/sc"
+          SC="$RUNNER_TEMP/sc/shellcheck"
+          "$SC" --version
+          "$SC" pickle
+          "$SC" -e SC1090,SC1091 test/run.sh test/cases/*.sh
 
       - name: tests
         run: ./test/run.sh
