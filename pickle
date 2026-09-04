@@ -298,20 +298,22 @@ target_ref() {
     fi
 }
 
-# Get onto the release branch, creating a local tracking branch if we only have
-# the remote one, and fast-forwarding if the remote has moved ahead.
 ORIG_BRANCH=""
 
 # Leaving someone on a branch they did not ask to be on is a small rudeness that
-# a scheduled job never notices and a person always does.
-# shellcheck disable=SC2329  # invoked via trap
+# a scheduled job never notices and a person always does. Called from finish()
+# on the normal path and from an EXIT trap when die() cuts the run short.
 restore_branch() {
-    [[ -n $ORIG_BRANCH ]] || return 0
-    [[ $ORIG_BRANCH != "$TARGET" ]] || return 0
-    git rev-parse --verify --quiet "refs/heads/$ORIG_BRANCH" >/dev/null || return 0
-    git switch --quiet "$ORIG_BRANCH" 2>/dev/null || true
+    local target=$ORIG_BRANCH
+    ORIG_BRANCH=""                      # idempotent: only the first call acts
+    [[ -n $target ]] || return 0
+    [[ $target != "$TARGET" ]] || return 0
+    git rev-parse --verify --quiet "refs/heads/$target" >/dev/null || return 0
+    git switch --quiet "$target" 2>/dev/null || true
 }
 
+# Get onto the release branch, creating a local tracking branch if we only have
+# the remote one, and fast-forwarding if the remote has moved ahead.
 checkout_target() {
     local cur
     cur=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
@@ -721,6 +723,7 @@ maybe_push() {
 
 finish() {
     write_step_summary
+    restore_branch
     (( ${#CONFLICTS[@]} )) && exit $EX_FAIL
     exit $EX_OK
 }
