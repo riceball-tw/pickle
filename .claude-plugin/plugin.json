@@ -1,0 +1,13 @@
+{
+  "name": "pickle",
+  "description": "Backport hotfixes from trunk onto a release branch with git alone: cut, sync, status, pick and skip, plus how to resolve the conflicts pickle stops on.",
+  "version": "1.0.0",
+  "author": {
+    "name": "riceball-tw",
+    "url": "https://github.com/riceball-tw"
+  },
+  "homepage": "https://github.com/riceball-tw/pickle",
+  "repository": "https://github.com/riceball-tw/pickle",
+  "license": "MIT",
+  "keywords": ["git", "backport", "cherry-pick", "release-branch", "ci"]
+}

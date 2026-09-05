@@ -246,6 +246,25 @@ run. pickle supplies `pickle <noreply@pickle.invalid>` as the *committer* and
 leaves the original author untouched, so `git log` still credits whoever wrote
 the fix.
 
+## Agent skill
+
+`skills/pickle/` is an [agent skill](https://code.claude.com/docs/en/skills): the
+commands, the exit codes, the `--dry-run`-first habit, and how to resolve a
+conflict without dropping the `-x` trailer. Install it whichever way suits your
+agent — all three pull the same directory.
+
+```bash
+# any agent — Claude Code, Cursor, Copilot, Cline and others
+npx skills add riceball-tw/pickle
+
+# Claude Code, as a plugin that updates with this repo
+/plugin marketplace add riceball-tw/pickle
+/plugin install pickle@pickle
+
+# or just copy it
+cp -r skills/pickle ~/.claude/skills/      # or .claude/skills/ for one project
+```
+
 ## What it deliberately does not do
 
 Tagging and releases. PR or MR creation. Changelogs. Anything needing a hosting
