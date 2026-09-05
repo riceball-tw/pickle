@@ -1,16 +1,17 @@
 # pickle
 
-A release backport tool that is only git.
+**English** · [繁體中文](README.zh-TW.md)
+
+> A release backport tool built around git.
 
 At feature freeze you cut a release branch. For the next week or two, every
 hotfix that lands on trunk has to be cherry-picked onto it — which gets
 forgotten, done twice, or done in the wrong order. `pickle` is one bash script
-that does it on a schedule.
+that does it automatically.
 
-It talks to nothing but `git`. No GitHub or GitLab API, no tokens beyond what
-`git push` already needs, no config file, no state files, no bot account. The
-same command runs identically on GitHub Actions, GitLab CI, Jenkins, Drone, or
-your laptop, and keeps working if you change hosts.
+It talks to nothing but `git`, so the same command runs identically on GitHub
+Actions, GitLab CI, Jenkins, Drone or a laptop, and keeps working if you change
+hosts.
 
 ```
 $ pickle sync --target release/1.2 --from main
@@ -29,10 +30,10 @@ pickle  main → release/1.2
 
 ## Install
 
-One file, no dependencies beyond bash 4+ and git.
+One file, nothing beyond bash 4+ and git.
 
 On **GitHub Actions** there is nothing to install — the action carries the
-script, so the version is pinned by the tag you reference:
+script, so the tag you reference pins the version:
 
 ```yaml
 - uses: riceball-tw/pickle@v1
@@ -52,78 +53,61 @@ chmod +x /usr/local/bin/pickle
 ## Use
 
 ```bash
-# once, at feature freeze
-pickle cut --target release/1.2 --from main
-
-# then on a schedule, or on every merge to trunk
-pickle sync --target release/1.2 --from main
-
-# see what it would do, without doing it
-pickle status --target release/1.2 --from main
+pickle cut    --target release/1.2 --from main   # once, at feature freeze
+pickle sync   --target release/1.2 --from main   # then on a schedule
+pickle status --target release/1.2 --from main   # what sync would do, without doing it
 ```
 
-`sync` is idempotent. Run it as often as you like.
-
-It also puts you back on the branch you were standing on, so running it locally
-does not quietly move you somewhere else.
+`sync` is idempotent, so run it as often as you like. It also puts you back on
+the branch you were standing on.
 
 ## How it decides what to pick
 
 By default it reads the Conventional Commit type off the subject line and takes
-`fix` commits, which is the same rule semver uses for a patch release:
+`fix` commits, the same rule semver uses for a patch release. Add types, or
+replace the rule with a regex:
 
 ```bash
 pickle sync --target release/1.2 --types fix,perf
-```
-
-If your team writes commits some other way, replace the rule with a regex:
-
-```bash
 pickle sync --target release/1.2 --include '^\[HOTFIX\]' --exclude 'WIP'
 ```
 
-And if the rule is not expressible as a regex at all, pickle will read commits
-on stdin, so any `git log` invocation you can write becomes a selection rule:
+And if the rule is not expressible as a regex at all, pickle reads commits on
+stdin, so any `git log` invocation you can write becomes a selection rule:
 
 ```bash
 git log --format=%H --grep=URGENT --author=oncall main \
   | pickle pick --target release/1.2 -
 ```
 
-Breaking changes (`fix!:`, or a `BREAKING CHANGE:` trailer) are excluded by
-default — they are the one thing that should never appear in a patch release.
-`--allow-breaking` includes them.
-
-Merge commits are skipped by default, which is right if you squash-merge. If
-your trunk carries the conventional subject on the merge commit instead, use
-`--first-parent` and pickle will walk trunk's first-parent line and pick merges
-with `-m 1`.
+Breaking changes (`fix!:`, or a `BREAKING CHANGE:` trailer) are excluded — they
+are the one thing that should never appear in a patch release; `--allow-breaking`
+includes them. Merge commits are skipped, which is right if you squash-merge; if
+your trunk carries the conventional subject on the merge commit instead,
+`--first-parent` walks trunk's first-parent line and picks merges with `-m 1`.
 
 ## How it avoids picking anything twice
 
 This is the part that has to be right, because `sync` will run hundreds of times
 against the same branch.
 
-1. **patch-id.** `git patch-id` hashes a commit's *diff*, normalising whitespace
-   and line numbers and ignoring the SHA, message, author and date. A hand
-   cherry-pick made with no flags, a rewritten message and a different author
-   still hashes identically to its original, so pickle sees it and skips it.
-   This needs no discipline from anyone and covers almost every case.
+1. **patch-id** hashes a commit's *diff*, normalising whitespace and line numbers
+   and ignoring the SHA, message, author and date. A hand cherry-pick with a
+   rewritten message and a different author still hashes identically to its
+   original, so pickle skips it. This needs discipline from nobody and covers
+   almost every case.
 
-2. **The `-x` trailer.** patch-id misses exactly one case: someone *resolved a
-   conflict*, so the diff that landed differs from the original. That is what
-   `git cherry-pick -x` is for — it records `(cherry picked from commit …)` in
-   the message, and `git cherry-pick --continue` carries that line through the
-   resolution. pickle scans the release branch for those trailers.
+2. **The `-x` trailer** covers the one case patch-id misses: someone *resolved a
+   conflict*, so the diff that landed differs from the original. `git cherry-pick
+   -x` records `(cherry picked from commit …)` in the message, `--continue`
+   carries that line through the resolution, and pickle scans the release branch
+   for it. You never have to remember this — when a pick conflicts, pickle prints
+   the exact commands to run, `-x` included.
 
-You never have to remember this. When a pick conflicts, pickle prints the exact
-commands to run, `-x` included.
-
-3. **`pickle skip`**, for the cases neither signal can see: a fix you decided
-   not to ship, or a bug fixed directly on the release branch with a fresh
-   commit. It writes an empty commit carrying the same trailer the detector
-   already reads, so it needs no new mechanism and leaves an auditable line in
-   history saying a human decided this on purpose.
+3. **`pickle skip`** covers what neither signal can see: a fix you decided not to
+   ship, or a bug fixed directly on the release branch. It writes an empty commit
+   carrying the same trailer the detector already reads — no new mechanism, and
+   an auditable line in history saying a human decided this on purpose.
 
 ```bash
 pickle skip --target release/1.2 abc1234 --reason "depends on a feature not in 1.2"
@@ -131,15 +115,14 @@ pickle skip --target release/1.2 abc1234 --reason "depends on a feature not in 1
 
 ## When something conflicts
 
-pickle picks in trunk order and **stops at the first conflict**. Commits that
-applied cleanly before it are kept and pushed; the conflicting one is aborted so
-the branch is left clean and no conflict markers can reach the remote; the run
-exits non-zero so the build goes red.
+pickle picks in trunk order and **stops at the first conflict**. Earlier commits
+are kept and pushed, the conflicting one is aborted so no conflict markers can
+reach the remote, and the run exits non-zero so the build goes red.
 
-Stopping is the default because it preserves order. If fix #4 quietly depends on
-fix #2, skipping #2 and landing #4 gives you a release branch that compiles and
-is wrong. `--keep-going` opts into that trade when your hotfixes are genuinely
-independent — it lands everything that applies and still exits non-zero.
+Stopping preserves order. If fix #4 quietly depends on fix #2, skipping #2 and
+landing #4 gives you a release branch that compiles and is wrong. `--keep-going`
+opts into that trade when your hotfixes are genuinely independent — it lands
+everything that applies and still exits non-zero.
 
 ```
   ✗ conflict picking 0cd7b34a  fix(DS-1240): retry on 502
@@ -183,10 +166,10 @@ independent — it lands everything that applies and still exits non-zero.
 | `--no-push` | off | Land commits locally but do not push. |
 | `--no-fetch` | off | Work with the refs already local. |
 
-Every flag also reads from a `PICKLE_`-prefixed environment variable
-(`PICKLE_TARGET`, `PICKLE_FROM`, `PICKLE_TYPES`, `PICKLE_INCLUDE`,
-`PICKLE_EXCLUDE`, `PICKLE_REMOTE`), since CI matrices set env more easily than
-they build argv. Flags win over environment.
+Every flag also reads a `PICKLE_`-prefixed environment variable (`PICKLE_TARGET`,
+`PICKLE_FROM`, `PICKLE_TYPES`, `PICKLE_INCLUDE`, `PICKLE_EXCLUDE`,
+`PICKLE_REMOTE`), since CI matrices set env more easily than they build argv.
+Flags win.
 
 ## Exit codes
 
@@ -202,9 +185,7 @@ PR, because that would mean a platform API, which is the thing it is not.
 
 ## CI
 
-See [`examples/`](examples/).
-
-### GitHub Actions
+Complete examples in [`examples/`](examples/).
 
 ```yaml
 - uses: actions/checkout@v4
@@ -222,47 +203,36 @@ See [`examples/`](examples/).
 | `command` | `sync` | `sync`, `status`, `cut` or `skip` |
 | `target` | — | Release branch. Required. |
 | `from` | repo default branch | Trunk branch. |
-| `types` | `fix` | Conventional Commit types, comma separated. |
-| `include` / `exclude` | — | Subject regexes, as per the flags above. |
+| `types`, `include`, `exclude` | | Selection, as per the flags above. |
 | `args` | — | Any other flags, verbatim: `--keep-going --allow-breaking` |
 
 The job needs `permissions: contents: write` to push.
 
-### Everything else
+Elsewhere, two things matter. **Full history**: `actions/checkout` defaults to
+`fetch-depth: 1`, which makes cherry-pick impossible — pickle deepens a shallow
+clone itself rather than failing, but set `fetch-depth: 0` so it does not pay for
+that every run. **Push rights** to the release branch: pickle pushes straight to
+it by design, so a protected `release/*` needs an exception for the CI identity,
+or run pickle somewhere that can push.
 
-Two things matter:
-
-- **Give the checkout full history.** `actions/checkout` defaults to
-  `fetch-depth: 1`, which makes cherry-pick impossible. pickle detects a shallow
-  clone and deepens it itself rather than failing, but set `fetch-depth: 0` so
-  it does not pay for that on every run.
-- **The job needs push rights** to the release branch. If `release/*` is a
-  protected branch, a direct push will be rejected — pickle pushes straight to
-  the branch by design, so either grant the CI identity an exception or run
-  pickle somewhere that can push.
-
-CI checkouts have no `user.email`, which normally makes `cherry-pick` refuse to
-run. pickle supplies `pickle <noreply@pickle.invalid>` as the *committer* and
-leaves the original author untouched, so `git log` still credits whoever wrote
-the fix.
+No `user.email` is needed. CI checkouts have none, which normally makes
+`cherry-pick` refuse to run; pickle supplies `pickle <noreply@pickle.invalid>` as
+the *committer* and leaves the original author untouched, so `git log` still
+credits whoever wrote the fix.
 
 ## Agent skill
 
-`skills/pickle/` is an [agent skill](https://code.claude.com/docs/en/skills): the
-commands, the exit codes, the `--dry-run`-first habit, and how to resolve a
-conflict without dropping the `-x` trailer. Install it whichever way suits your
-agent — all three pull the same directory.
+`skills/pickle/` teaches a coding agent to drive this tool: the commands, the
+exit codes, the `--dry-run`-first habit, and how to resolve a conflict without
+dropping the `-x` trailer.
 
 ```bash
-# any agent — Claude Code, Cursor, Copilot, Cline and others
-npx skills add riceball-tw/pickle
+npx skills add riceball-tw/pickle           # any agent: Claude Code, Cursor, …
 
-# Claude Code, as a plugin that updates with this repo
-/plugin marketplace add riceball-tw/pickle
+/plugin marketplace add riceball-tw/pickle  # Claude Code, as a plugin
 /plugin install pickle@pickle
 
-# or just copy it
-cp -r skills/pickle ~/.claude/skills/      # or .claude/skills/ for one project
+cp -r skills/pickle ~/.claude/skills/       # or just copy it
 ```
 
 ## What it deliberately does not do
@@ -272,8 +242,8 @@ platform's API. Forward-porting hotfixes from a release branch back to trunk.
 
 pickle assumes you cut the release branch from trunk at feature freeze and
 backport forward from there. It is not built for long-lived LTS branches that
-assemble a release by picking onto a much older base — that works, but you will
-spend your life resolving conflicts, and the tool cannot help with that.
+assemble a release onto a much older base — that works, but you will spend your
+life resolving conflicts, and the tool cannot help with that.
 
 ## Tests
 
